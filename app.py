@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 """
 TwinPicks HR Finder — Standalone
-=================================
-Dedicated HR research tool. Filters to players with sportsbook HR props,
-uses starting pitcher as the matchup lens, full Statcast profile.
-
-Data sources:
-  - MLB Stats API (free): today's games, probable pitchers, lineups, pitcher stats
-  - Baseball Savant (free): EV, barrel%, LA, pull%, FB%, xwOBA, ISO, BIP
-  - The Odds API: sportsbook HR props (FanDuel)
 """
 
 import os, json, csv, io, threading
@@ -23,7 +15,6 @@ except Exception:
     EST = None
 
 app = Flask(__name__)
-
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
 DATA_DIR = "/data" if os.path.isdir("/data") else "."
 
@@ -59,16 +50,35 @@ PARK_FACTORS = {
     "LAA": 0.96, "SEA": 0.95, "SD":  0.95, "SF":  0.92, "OAK": 0.97,
 }
 
+# ── Team IDs for logos ────────────────────────────────────────────────────────
+
+TEAM_IDS = {
+    "ARI": 109, "ATL": 144, "BAL": 110, "BOS": 111, "CHC": 112,
+    "CWS": 145, "CIN": 113, "CLE": 114, "COL": 115, "DET": 116,
+    "HOU": 117, "KC":  118, "LAA": 108, "LAD": 119, "MIA": 146,
+    "MIL": 158, "MIN": 142, "NYM": 121, "NYY": 147, "OAK": 133,
+    "PHI": 143, "PIT": 134, "SD":  135, "SF":  137, "SEA": 136,
+    "STL": 138, "TB":  139, "TEX": 140, "TOR": 141, "WSH": 120,
+}
+
+def team_logo(abbr):
+    tid = TEAM_IDS.get(abbr)
+    return "https://www.mlbstatic.com/team-logos/{}.svg".format(tid) if tid else ""
+
 # ── Cache ─────────────────────────────────────────────────────────────────────
 
 _cache = {
-    "date": None,
-    "candidates": [],
-    "games": 0,
-    "with_props": 0,
-    "last_refresh": None,
-    "status": "idle",
-    "error": None,
+    "date":              None,
+    "candidates":        [],
+    "games_meta":        [],
+    "games":             0,
+    "with_props":        0,
+    "odds_loaded":       False,
+    "lineups_available": False,
+    "last_refresh":      None,
+    "status":            "idle",
+    "error":             None,
+    "_raw":              {},
 }
 _lock = threading.Lock()
 
@@ -83,46 +93,46 @@ def _mlb_get(url):
         with urllib.request.urlopen(req, timeout=15) as r:
             return json.loads(r.read().decode())
     except Exception as e:
-        print(f"[MLB] {url[:80]} → {e}")
+        print("[MLB] {}... -> {}".format(url[:80], e))
         return {}
 
 def fetch_games(date=None):
     date = date or today_str()
-    d = _mlb_get(f"{MLB}/schedule?sportId=1&date={date}&hydrate=probablePitcher,lineups,team")
+    d = _mlb_get("{}/schedule?sportId=1&date={}&hydrate=probablePitcher,lineups,team".format(MLB, date))
     games = []
     for entry in d.get("dates", []):
         for g in entry.get("games", []):
             teams = g.get("teams", {})
-            home = teams.get("home", {})
-            away = teams.get("away", {})
-            ht = home.get("team", {})
-            at = away.get("team", {})
+            home  = teams.get("home", {})
+            away  = teams.get("away", {})
+            ht    = home.get("team", {})
+            at    = away.get("team", {})
             ha, aa = ht.get("abbreviation", ""), at.get("abbreviation", "")
-            hsp = home.get("probablePitcher", {})
-            asp = away.get("probablePitcher", {})
+            hsp   = home.get("probablePitcher", {})
+            asp   = away.get("probablePitcher", {})
             lineups = g.get("lineups", {})
             games.append({
-                "label":        f"{aa} @ {ha}",
-                "home_abbr":    ha,
-                "away_abbr":    aa,
-                "home_team":    ht.get("name", ""),
-                "away_team":    at.get("name", ""),
-                "home_id":      ht.get("id"),
-                "away_id":      at.get("id"),
-                "park_factor":  PARK_FACTORS.get(ha, 1.0),
-                "home_sp":      {"id": hsp.get("id"), "name": hsp.get("fullName", "")},
-                "away_sp":      {"id": asp.get("id"), "name": asp.get("fullName", "")},
-                "home_lineup":  [p.get("fullName","") for p in lineups.get("homePlayers", [])],
-                "away_lineup":  [p.get("fullName","") for p in lineups.get("awayPlayers", [])],
+                "label":       "{} @ {}".format(aa, ha),
+                "home_abbr":   ha,
+                "away_abbr":   aa,
+                "home_team":   ht.get("name", ""),
+                "away_team":   at.get("name", ""),
+                "home_id":     ht.get("id"),
+                "away_id":     at.get("id"),
+                "park_factor": PARK_FACTORS.get(ha, 1.0),
+                "home_sp":     {"id": hsp.get("id"), "name": hsp.get("fullName", "")},
+                "away_sp":     {"id": asp.get("id"), "name": asp.get("fullName", "")},
+                "home_lineup": [p.get("fullName","") for p in lineups.get("homePlayers", [])],
+                "away_lineup": [p.get("fullName","") for p in lineups.get("awayPlayers", [])],
             })
-    print(f"[MLB] {len(games)} games for {date}")
+    print("[MLB] {} games for {}".format(len(games), date))
     return games
 
 def fetch_pitcher_stats(pid):
     if not pid:
         return {}
     year = now_est().year
-    d = _mlb_get(f"{MLB}/people/{pid}/stats?stats=season&group=pitching&season={year}&sportId=1")
+    d = _mlb_get("{}/people/{}/stats?stats=season&group=pitching&season={}&sportId=1".format(MLB, pid, year))
     for split in (d.get("stats") or [{}])[0].get("splits", []):
         s = split.get("stat", {})
         ip_str = str(s.get("inningsPitched", "0"))
@@ -144,22 +154,20 @@ def fetch_pitcher_stats(pid):
     return {}
 
 def fetch_roster(team_id):
-    """Fetch active roster for a team. Returns list of player fullNames."""
     if not team_id:
         return []
     year = now_est().year
-    d = _mlb_get(f"{MLB}/teams/{team_id}/roster?rosterType=active&season={year}")
+    d = _mlb_get("{}/teams/{}/roster?rosterType=active&season={}".format(MLB, team_id, year))
     return [p.get("person",{}).get("fullName","") for p in d.get("roster",[]) if p.get("person",{}).get("fullName")]
-
 
 def fetch_batter_recent(bid):
     if not bid:
         return {}
     year = now_est().year
-    d = _mlb_get(f"{MLB}/people/{bid}/stats?stats=season&group=hitting&season={year}&sportId=1")
+    d = _mlb_get("{}/people/{}/stats?stats=season&group=hitting&season={}&sportId=1".format(MLB, bid, year))
     for split in (d.get("stats") or [{}])[0].get("splits", []):
         s = split.get("stat", {})
-        g = _i(s.get("gamesPlayed", 0))
+        g  = _i(s.get("gamesPlayed", 0))
         hr = _i(s.get("homeRuns", 0))
         return {
             "games":    g,
@@ -193,11 +201,11 @@ def _sv_name(row, nc, fc, lc):
             parts = raw.split(",", 1)
             last  = parts[0].strip().strip('"')
             first = parts[1].strip().strip('"') if len(parts) > 1 else ""
-            return f"{first} {last}".strip() if first else last
+            return "{} {}".format(first, last).strip() if first else last
         return raw
     fn = (row.get(fc) or "").strip() if fc else ""
     ln = (row.get(lc) or "").strip() if lc else ""
-    return f"{fn} {ln}".strip()
+    return "{} {}".format(fn, ln).strip()
 
 def _sv_csv(url, label):
     try:
@@ -207,7 +215,7 @@ def _sv_csv(url, label):
         with urllib.request.urlopen(req, timeout=30) as r:
             raw = r.read().decode("utf-8-sig")
     except Exception as e:
-        print(f"[{label}] fetch error: {e}")
+        print("[{}] fetch error: {}".format(label, e))
         return None, None
     if not raw or len(raw) < 100 or "<html" in raw[:50].lower():
         return None, None
@@ -216,25 +224,22 @@ def _sv_csv(url, label):
         fn = reader.fieldnames or []
         return fn, list(reader)
     except Exception as e:
-        print(f"[{label}] parse error: {e}")
+        print("[{}] parse error: {}".format(label, e))
         return None, None
 
 def fetch_savant_spray(year=None, min_pa=30):
-    """Fetch pull%, FB%, GB%, LD%, oppo% from Savant Custom Leaderboard.
-    These columns do NOT exist in the standard EV leaderboard CSV."""
     year = year or now_est().year
     selections = "b_total_pa,pull_percent,opposite_percent,groundballs_percent,flyballs_percent,linedrives_percent,popups_percent"
-    url = (f"https://baseballsavant.mlb.com/leaderboard/custom"
-           f"?year={year}&type=batter&filter=&sort=4&sportId=1"
-           f"&startInning=1&endInning=9&min={min_pa}"
-           f"&selections={selections}"
-           f"&chart=false&x=b_total_pa&y=pull_percent&r=no&chartType=beeswarm&csv=true")
-    fn, rows = _sv_csv(url, f"SV-Spray")
+    url = ("https://baseballsavant.mlb.com/leaderboard/custom"
+           "?year={}&type=batter&filter=&sort=4&sportId=1"
+           "&startInning=1&endInning=9&min={}"
+           "&selections={}"
+           "&chart=false&x=b_total_pa&y=pull_percent&r=no&chartType=beeswarm&csv=true").format(year, min_pa, selections)
+    fn, rows = _sv_csv(url, "SV-Spray")
     if not fn or not rows:
         if year == now_est().year:
             return fetch_savant_spray(year - 1, min_pa)
         return {}
-
     nc = _sv_col(fn, "last_name, first_name", "player_name", "name")
     fc = _sv_col(fn, "first_name", "name_first")
     lc = _sv_col(fn, "last_name",  "name_last")
@@ -245,7 +250,6 @@ def fetch_savant_spray(year=None, min_pa=30):
         "fb":   _sv_col(fn, "flyballs_percent"),
         "ld":   _sv_col(fn, "linedrives_percent"),
     }
-    print(f"[SV-Spray] cols: pull={cols['pull']} fb={cols['fb']} gb={cols['gb']}")
     out = {}
     for r in rows:
         try:
@@ -255,18 +259,16 @@ def fetch_savant_spray(year=None, min_pa=30):
             out[name] = {k: _f(_sv_get(r, cols[k])) for k in cols if cols[k]}
         except Exception:
             continue
-    print(f"[SV-Spray] {len(out)} players")
+    print("[SV-Spray] {} players".format(len(out)))
     return out
-
 
 def fetch_savant_ev(ptype="batter", year=None, min_bbe=50):
     year = year or now_est().year
-    url = (f"https://baseballsavant.mlb.com/leaderboard/statcast"
-           f"?type={ptype}&year={year}&position=&team=&min={min_bbe}&csv=true")
-    fn, rows = _sv_csv(url, f"SV-EV-{ptype}")
+    url = ("https://baseballsavant.mlb.com/leaderboard/statcast"
+           "?type={}&year={}&position=&team=&min={}&csv=true").format(ptype, year, min_bbe)
+    fn, rows = _sv_csv(url, "SV-EV-{}".format(ptype))
     if not fn or not rows:
         return fetch_savant_ev(ptype, year - 1, min_bbe) if year == now_est().year else {}
-
     nc  = _sv_col(fn, "last_name, first_name", "player_name", "name")
     fc  = _sv_col(fn, "first_name", "name_first")
     lc  = _sv_col(fn, "last_name",  "name_last")
@@ -285,7 +287,6 @@ def fetch_savant_ev(ptype="batter", year=None, min_bbe=50):
         "ld":     _sv_col(fn, "linedrives_percent",    "line_drive_percent", "ld_pct"),
         "bbe":    _sv_col(fn, "attempts",              "bbe"),
     }
-    print(f"[SV-EV-{ptype}] pull={cols['pull']} fb={cols['fb']} brl={cols['brl']}")
     out = {}
     for r in rows:
         try:
@@ -295,17 +296,16 @@ def fetch_savant_ev(ptype="batter", year=None, min_bbe=50):
             out[name] = {k: _f(_sv_get(r, cols[k])) for k in cols if cols[k]}
         except Exception:
             continue
-    print(f"[SV-EV-{ptype}] {len(out)} players")
+    print("[SV-EV-{}] {} players".format(ptype, len(out)))
     return out
 
 def fetch_savant_xstats(ptype="batter", year=None, min_pa=50):
     year = year or now_est().year
-    url = (f"https://baseballsavant.mlb.com/leaderboard/expected_statistics"
-           f"?type={ptype}&year={year}&position=&team=&min={min_pa}&csv=true")
-    fn, rows = _sv_csv(url, f"SV-xST-{ptype}")
+    url = ("https://baseballsavant.mlb.com/leaderboard/expected_statistics"
+           "?type={}&year={}&position=&team=&min={}&csv=true").format(ptype, year, min_pa)
+    fn, rows = _sv_csv(url, "SV-xST-{}".format(ptype))
     if not fn or not rows:
         return fetch_savant_xstats(ptype, year - 1, min_pa) if year == now_est().year else {}
-
     nc = _sv_col(fn, "last_name, first_name", "player_name", "name")
     fc = _sv_col(fn, "first_name", "name_first")
     lc = _sv_col(fn, "last_name",  "name_last")
@@ -334,7 +334,7 @@ def fetch_savant_xstats(ptype="batter", year=None, min_pa=50):
             out[name] = row
         except Exception:
             continue
-    print(f"[SV-xST-{ptype}] {len(out)} players")
+    print("[SV-xST-{}] {} players".format(ptype, len(out)))
     return out
 
 # ── Odds API ──────────────────────────────────────────────────────────────────
@@ -344,43 +344,31 @@ def fetch_hr_props():
         return {}
     try:
         req = urllib.request.Request(
-            f"https://api.the-odds-api.com/v4/sports/baseball_mlb/events"
-            f"?apiKey={ODDS_API_KEY}&dateFormat=iso")
+            "https://api.the-odds-api.com/v4/sports/baseball_mlb/events"
+            "?apiKey={}&dateFormat=iso".format(ODDS_API_KEY))
         req.add_header("User-Agent", "TwinPicks-HRFinder/1.0")
         with urllib.request.urlopen(req, timeout=15) as r:
             events = json.loads(r.read().decode())
     except Exception as e:
-        print(f"[Odds] events error: {e}")
+        print("[Odds] events error: {}".format(e))
         return {}
 
-    today = today_str()
+    today  = today_str()
     events = [e for e in events if e.get("commence_time","").startswith(today)]
-    print(f"[Odds] {len(events)} events for {today}")
+    print("[Odds] {} events for {}".format(len(events), today))
     props = {}
-    _logged_sample = False
     for event in events[:20]:
         eid = event.get("id")
         if not eid:
             continue
         try:
             req = urllib.request.Request(
-                f"https://api.the-odds-api.com/v4/sports/baseball_mlb/events/{eid}/odds"
-                f"?apiKey={ODDS_API_KEY}&markets=batter_home_runs"
-                f"&bookmakers=fanduel&oddsFormat=american")
+                "https://api.the-odds-api.com/v4/sports/baseball_mlb/events/{}/odds"
+                "?apiKey={}&markets=batter_home_runs&bookmakers=fanduel&oddsFormat=american".format(eid, ODDS_API_KEY))
             req.add_header("User-Agent", "TwinPicks-HRFinder/1.0")
             with urllib.request.urlopen(req, timeout=15) as r:
                 data = json.loads(r.read().decode())
-
-            # Log the first event response for debugging
-            if not _logged_sample:
-                bks = data.get("bookmakers", [])
-                mkts = bks[0].get("markets", []) if bks else []
-                print(f"[Odds] Sample event '{event.get('away_team')} @ {event.get('home_team')}'"
-                      f" — bookmakers: {len(bks)}, markets: {[m.get('key') for m in mkts]}"
-                      f", outcomes: {len(mkts[0].get('outcomes',[])) if mkts else 0}")
-                _logged_sample = True
-
-            glabel = event.get("away_team","") + " @ " + event.get("home_team","")
+            glabel = "{} @ {}".format(event.get("away_team",""), event.get("home_team",""))
             for bk in data.get("bookmakers", []):
                 for mkt in bk.get("markets", []):
                     if mkt.get("key") != "batter_home_runs":
@@ -400,8 +388,8 @@ def fetch_hr_props():
                         elif side == "under":
                             props[pname]["under_odds"] = odds
         except Exception as e:
-            print(f"[Odds] event {eid}: {e}")
-    print(f"[Odds] {len(props)} HR props")
+            print("[Odds] event {}: {}".format(eid, e))
+    print("[Odds] {} HR props".format(len(props)))
     return props
 
 # ── Fuzzy name match ──────────────────────────────────────────────────────────
@@ -434,79 +422,69 @@ def american_to_implied(odds):
         return 0.5
 
 def score_candidate(bsv, bxst, psv, pxst, pmlb, pf):
-    """Return (hr_score, signals[])"""
     sc = 0
     sigs = []
+    ev    = bsv.get("ev", 0)
+    brl   = bsv.get("brl", 0)
+    la    = bsv.get("la", 0)
+    ss    = bsv.get("ss", 0)
+    pull  = bsv.get("pull", 0)
+    fb    = bsv.get("fb", 0)
+    iso   = bxst.get("iso", 0)
+    xwoba = bxst.get("xwoba", 0)
+    xslg  = bxst.get("xslg", 0)
+    slg   = bxst.get("slg", 0)
 
-    ev      = bsv.get("ev", 0)
-    brl     = bsv.get("brl", 0)
-    la      = bsv.get("la", 0)
-    ss      = bsv.get("ss", 0)
-    pull    = bsv.get("pull", 0)
-    fb      = bsv.get("fb", 0)
-    hh      = bsv.get("hh", 0)
-    iso     = bxst.get("iso", 0)
-    xwoba   = bxst.get("xwoba", 0)
-    xslg    = bxst.get("xslg", 0)
-    slg     = bxst.get("slg", 0)
-
-    # 1. Power core (EV + barrel)
     if brl >= 12 and ev >= 91:
-        sc += 4; sigs.append(f"Elite power: {ev:.1f} EV, {brl:.1f}% barrel")
+        sc += 4; sigs.append("Elite power: {:.1f} EV, {:.1f}% barrel".format(ev, brl))
     elif brl >= 9 and ev >= 89:
-        sc += 3; sigs.append(f"Strong power: {ev:.1f} EV, {brl:.1f}% barrel")
+        sc += 3; sigs.append("Strong power: {:.1f} EV, {:.1f}% barrel".format(ev, brl))
     elif brl >= 7 and ev >= 87:
-        sc += 2; sigs.append(f"Good power: {ev:.1f} EV, {brl:.1f}% barrel")
+        sc += 2; sigs.append("Good power: {:.1f} EV, {:.1f}% barrel".format(ev, brl))
     elif ev > 0 and ev < 86:
-        sc -= 3; sigs.append(f"Low EV ({ev:.1f}) — HR unlikely")
+        sc -= 3; sigs.append("Low EV ({:.1f}) — HR unlikely".format(ev))
     elif ev > 0 and ev < 88:
         sc -= 1
 
-    # 2. Launch angle
     if 18 <= la <= 28:
-        sc += 2; sigs.append(f"HR-zone LA: {la:.0f}°")
+        sc += 2; sigs.append("HR-zone LA: {:.0f}°".format(la))
     elif 14 <= la <= 32:
         sc += 1
     elif la > 0 and (la > 36 or la < 8):
         sc -= 1
 
-    # 3. ISO
     if iso >= 0.250:
-        sc += 3; sigs.append(f"Elite ISO: .{int(iso*1000):03d}")
+        sc += 3; sigs.append("Elite ISO: .{:03d}".format(int(iso*1000)))
     elif iso >= 0.200:
-        sc += 2; sigs.append(f"Power ISO: .{int(iso*1000):03d}")
+        sc += 2; sigs.append("Power ISO: .{:03d}".format(int(iso*1000)))
     elif iso >= 0.170:
         sc += 1
     elif 0 < iso < 0.120:
         sc -= 1
 
-    # 4. Pull flyball profile
     if pull >= 48 and fb >= 42:
-        sc += 2; sigs.append(f"Pull flyball hitter: {pull:.0f}% pull, {fb:.0f}% FB")
+        sc += 2; sigs.append("Pull flyball hitter: {:.0f}% pull, {:.0f}% FB".format(pull, fb))
     elif pull >= 44 or fb >= 40:
         sc += 1
 
-    # 5. xwOBA quality
     if xwoba >= 0.400:
-        sc += 2; sigs.append(f"Elite xwOBA: .{int(xwoba*1000):03d}")
+        sc += 2; sigs.append("Elite xwOBA: .{:03d}".format(int(xwoba*1000)))
     elif xwoba >= 0.360:
         sc += 1
     elif 0 < xwoba < 0.280:
         sc -= 1
 
-    # 6. Park
     if pf >= 1.05:
-        sc += 3; sigs.append(f"Hitter-friendly park (PF {pf:.2f})")
+        sc += 3; sigs.append("Hitter-friendly park (PF {:.2f})".format(pf))
     elif pf >= 1.02:
         sc += 2
     elif pf >= 1.0:
         sc += 1
     elif pf <= 0.95:
-        sc -= 2; sigs.append(f"Pitcher park (PF {pf:.2f})")
+        sc -= 2; sigs.append("Pitcher park (PF {:.2f})".format(pf))
     elif pf < 1.0:
         sc -= 1
 
-    # 7. Pitcher HR vulnerability
     hr9   = pmlb.get("hr_per_9", 0)
     pbrl  = psv.get("brl", 0)
     pev   = psv.get("ev", 0)
@@ -514,16 +492,16 @@ def score_candidate(bsv, bxst, psv, pxst, pmlb, pf):
     pera  = pxst.get("era", 0) or pmlb.get("era", 0)
 
     if hr9 >= 1.8:
-        sc += 3; sigs.append(f"HR-prone pitcher: {hr9:.1f} HR/9")
+        sc += 3; sigs.append("HR-prone pitcher: {:.1f} HR/9".format(hr9))
     elif hr9 >= 1.3:
-        sc += 2; sigs.append(f"Pitcher allows {hr9:.1f} HR/9")
+        sc += 2; sigs.append("Pitcher allows {:.1f} HR/9".format(hr9))
     elif hr9 >= 1.0:
         sc += 1
     elif 0 < hr9 <= 0.6:
-        sc -= 2; sigs.append(f"HR suppressor: {hr9:.1f} HR/9")
+        sc -= 2; sigs.append("HR suppressor: {:.1f} HR/9".format(hr9))
 
     if pbrl >= 10:
-        sc += 2; sigs.append(f"Pitcher allows {pbrl:.1f}% barrels")
+        sc += 2; sigs.append("Pitcher allows {:.1f}% barrels".format(pbrl))
     elif pbrl >= 7:
         sc += 1
 
@@ -531,22 +509,20 @@ def score_candidate(bsv, bxst, psv, pxst, pmlb, pf):
         sc += 1
 
     if 0 < pera < pxera - 0.5:
-        sc += 1; sigs.append(f"Pitcher ERA/xERA gap: {pera:.2f} ERA vs {pxera:.2f} xERA")
+        sc += 1; sigs.append("Pitcher ERA/xERA gap: {:.2f} ERA vs {:.2f} xERA".format(pera, pxera))
 
-    # 8. Sweet spot
     if ss >= 38:
         sc += 1
 
-    # 9. xSLG regression
     if xslg > slg + 0.05 > 0:
-        sc += 1; sigs.append(f"Power regression due: xSLG .{int(xslg*1000):03d} > SLG .{int(slg*1000):03d}")
+        sc += 1; sigs.append("Power regression due: xSLG .{:03d} > SLG .{:03d}".format(int(xslg*1000), int(slg*1000)))
 
     return sc, sigs
 
 def zone_fit(bsv, bxst):
     z = 0
     la, ss   = bsv.get("la",0), bsv.get("ss",0)
-    pull, fb  = bsv.get("pull",0), bsv.get("fb",0)
+    pull, fb = bsv.get("pull",0), bsv.get("fb",0)
     xwoba    = bxst.get("xwoba",0)
     if 18 <= la <= 28: z += 2
     elif 14 <= la <= 32: z += 1
@@ -561,7 +537,7 @@ def zone_fit(bsv, bxst):
 # ── Build candidates ──────────────────────────────────────────────────────────
 
 def build_candidates(games, hr_props, sv_bat, sv_pit, xst_bat, xst_pit, rosters=None):
-    player_map = {}  # name -> {game, team, opp_sp, park_factor}
+    player_map = {}
     for g in games:
         pf = g["park_factor"]
         hsp, asp = g["home_sp"], g["away_sp"]
@@ -572,9 +548,7 @@ def build_candidates(games, hr_props, sv_bat, sv_pit, xst_bat, xst_pit, rosters=
             player_map[name] = {"game": g["label"], "team": g["home_team"],
                                 "abbr": g["home_abbr"], "opp_sp": asp, "pf": pf}
 
-    # Fallback: use rosters when lineups aren't posted yet
     if rosters and not player_map:
-        print(f"[Build] Lineups empty — using rosters ({sum(len(v) for v in rosters.values())} players)")
         for g in games:
             pf = g["park_factor"]
             hsp, asp = g["home_sp"], g["away_sp"]
@@ -587,7 +561,6 @@ def build_candidates(games, hr_props, sv_bat, sv_pit, xst_bat, xst_pit, rosters=
                     player_map[name] = {"game": g["label"], "team": g["away_team"],
                                         "abbr": g["away_abbr"], "opp_sp": hsp, "pf": pf}
 
-    # Prop players not yet in lineup — guess from game label
     for pname, pdata in hr_props.items():
         if _match(pname, player_map):
             continue
@@ -598,13 +571,12 @@ def build_candidates(games, hr_props, sv_bat, sv_pit, xst_bat, xst_pit, rosters=
                                      "opp_sp": g["home_sp"], "pf": g["park_factor"]}
                 break
 
-    # Build pool: props first, then all mapped players (roster/lineup)
     pool = set(list(hr_props.keys()) + list(player_map.keys()))
-    print(f"[Build] pool={len(pool)} player_map={len(player_map)} props={len(hr_props)}")
+    print("[Build] pool={} player_map={} props={}".format(len(pool), len(player_map), len(hr_props)))
     cands = []
     for pname in pool:
-        bsv  = _match(pname, sv_bat)  or {}
-        bxst = _match(pname, xst_bat) or {}
+        bsv   = _match(pname, sv_bat)  or {}
+        bxst  = _match(pname, xst_bat) or {}
         ginfo = _match(pname, player_map) or {}
         prop  = _match(pname, hr_props) or {}
 
@@ -614,8 +586,9 @@ def build_candidates(games, hr_props, sv_bat, sv_pit, xst_bat, xst_pit, rosters=
         opp_sp  = ginfo.get("opp_sp") or {}
         sp_name = opp_sp.get("name", "") if isinstance(opp_sp, dict) else ""
         psv_raw = _match(sp_name, sv_pit) or {} if sp_name else {}
-        pmlb    = psv_raw.pop("_mlb", {}) if "_mlb" in psv_raw else {}
-        psv     = psv_raw
+        # Use .get not .pop — avoid mutating shared cache
+        pmlb    = psv_raw.get("_mlb", {})
+        psv     = {k: v for k, v in psv_raw.items() if k != "_mlb"}
         pxst    = _match(sp_name, xst_pit) or {} if sp_name else {}
 
         pf = ginfo.get("pf", 1.0)
@@ -626,18 +599,18 @@ def build_candidates(games, hr_props, sv_bat, sv_pit, xst_bat, xst_pit, rosters=
         implied   = american_to_implied(over_odds) if over_odds else None
         model_p   = min(0.92, max(0.04, sc / 26.0))
         edge      = round((model_p - implied) * 100, 1) if implied else None
-
-        era = pmlb.get("era",0) or pxst.get("era",0)
+        era       = pmlb.get("era",0) or pxst.get("era",0)
 
         cands.append({
-            "player":   pname,
-            "team":     ginfo.get("team",""),
-            "game":     ginfo.get("game", prop.get("game","")),
-            "hr_score": sc,
-            "zone_fit": zf,
+            "player":      pname,
+            "team":        ginfo.get("team",""),
+            "abbr":        ginfo.get("abbr",""),
+            "game":        ginfo.get("game", prop.get("game","")),
+            "hr_score":    sc,
+            "zone_fit":    zf,
             "park_factor": round(pf, 2),
-            "has_prop": bool(prop),
-            "signals":  sigs,
+            "has_prop":    bool(prop),
+            "signals":     sigs,
             "prop": {
                 "line":        prop.get("line", 0.5),
                 "over_odds":   over_odds,
@@ -671,6 +644,9 @@ def build_candidates(games, hr_props, sv_bat, sv_pit, xst_bat, xst_pit, rosters=
                 "hr_per_9":       pmlb.get("hr_per_9",0),
                 "hr_allowed":     pmlb.get("hr_allowed",0),
                 "ip":             pmlb.get("ip",0),
+                "k9":             pmlb.get("k9",0),
+                "whip":           pmlb.get("whip",0),
+                "gs":             pmlb.get("gs",0),
                 "barrel_allowed": psv.get("brl",0),
                 "ev_allowed":     psv.get("ev",0),
                 "hh_allowed":     psv.get("hh",0),
@@ -686,7 +662,47 @@ def build_candidates(games, hr_props, sv_bat, sv_pit, xst_bat, xst_pit, rosters=
     ), reverse=True)
     return cands
 
-# ── Refresh ───────────────────────────────────────────────────────────────────
+# ── Build game metadata ───────────────────────────────────────────────────────
+
+def build_games_meta(games, sv_pit, xst_pit):
+    meta = []
+    for g in games:
+        def sp_info(sp):
+            if not sp.get("name"):
+                return {"name": "TBD", "era": 0, "hr_per_9": 0, "ip": 0,
+                        "k9": 0, "whip": 0, "gs": 0, "xera": 0,
+                        "barrel_allowed": 0, "ev_allowed": 0, "hr_allowed": 0}
+            name = sp["name"]
+            sv   = _match(name, sv_pit) or {}
+            mlb  = sv.get("_mlb", {})
+            xst  = _match(name, xst_pit) or {}
+            return {
+                "name":           name,
+                "era":            mlb.get("era", 0) or xst.get("era", 0),
+                "hr_per_9":       mlb.get("hr_per_9", 0),
+                "hr_allowed":     mlb.get("hr_allowed", 0),
+                "ip":             mlb.get("ip", 0),
+                "k9":             mlb.get("k9", 0),
+                "whip":           mlb.get("whip", 0),
+                "gs":             mlb.get("gs", 0),
+                "xera":           xst.get("xera", 0),
+                "barrel_allowed": sv.get("brl", 0),
+                "ev_allowed":     sv.get("ev", 0),
+            }
+        meta.append({
+            "label":      g["label"],
+            "home_abbr":  g["home_abbr"],
+            "away_abbr":  g["away_abbr"],
+            "home_name":  g["home_team"],
+            "away_name":  g["away_team"],
+            "home_logo":  team_logo(g["home_abbr"]),
+            "away_logo":  team_logo(g["away_abbr"]),
+            "home_sp":    sp_info(g["home_sp"]),
+            "away_sp":    sp_info(g["away_sp"]),
+        })
+    return meta
+
+# ── Refresh (no odds) ─────────────────────────────────────────────────────────
 
 def refresh(force=False):
     global _cache
@@ -697,16 +713,14 @@ def refresh(force=False):
         _cache["status"] = "refreshing"
         _cache["error"]  = None
 
-    print(f"[Refresh] Starting for {today}")
+    print("[Refresh] Starting for {}".format(today))
     try:
-        games    = fetch_games(today)
-        hr_props = fetch_hr_props()
-        sv_bat   = fetch_savant_ev("batter")
-        sv_pit   = fetch_savant_ev("pitcher", min_bbe=30)
-        xst_bat  = fetch_savant_xstats("batter")
-        xst_pit  = fetch_savant_xstats("pitcher", min_pa=25)
+        games   = fetch_games(today)
+        sv_bat  = fetch_savant_ev("batter")
+        sv_pit  = fetch_savant_ev("pitcher", min_bbe=30)
+        xst_bat = fetch_savant_xstats("batter")
+        xst_pit = fetch_savant_xstats("pitcher", min_pa=25)
 
-        # Spray data (pull%, FB%, GB%) — separate Savant endpoint
         spray = fetch_savant_spray()
         for name, sp_data in spray.items():
             matched = _match(name, sv_bat)
@@ -714,9 +728,8 @@ def refresh(force=False):
                 matched.update(sp_data)
             else:
                 sv_bat[name] = sp_data
-        print(f"[Refresh] Spray merged into {len(sv_bat)} batters")
+        print("[Refresh] Spray merged into {} batters".format(len(sv_bat)))
 
-        # MLB pitcher stats for today's starters
         for g in games:
             for key in ("home_sp", "away_sp"):
                 sp = g[key]
@@ -728,7 +741,6 @@ def refresh(force=False):
                             sv_pit[sname] = {}
                         sv_pit[sname]["_mlb"] = stats
 
-        # Roster fallback when lineups aren't posted yet
         lineups_available = any(g["home_lineup"] or g["away_lineup"] for g in games)
         rosters = {}
         if not lineups_available and games:
@@ -738,28 +750,66 @@ def refresh(force=False):
                                   (g["away_abbr"], g.get("away_id"))]:
                     if abbr and abbr not in rosters:
                         rosters[abbr] = fetch_roster(tid)
-            total_roster = sum(len(v) for v in rosters.values())
-            print(f"[Refresh] Rosters: {len(rosters)} teams, {total_roster} players")
+            print("[Refresh] Rosters: {} teams, {} players".format(
+                len(rosters), sum(len(v) for v in rosters.values())))
 
-        cands = build_candidates(games, hr_props, sv_bat, sv_pit, xst_bat, xst_pit, rosters)
+        games_meta = build_games_meta(games, sv_pit, xst_pit)
+        cands = build_candidates(games, {}, sv_bat, sv_pit, xst_bat, xst_pit, rosters)
 
         with _lock:
             _cache.update({
                 "date":              today,
                 "candidates":        cands,
+                "games_meta":        games_meta,
                 "games":             len(games),
-                "with_props":        sum(1 for c in cands if c["has_prop"]),
+                "with_props":        0,
+                "odds_loaded":       False,
                 "lineups_available": lineups_available,
                 "last_refresh":      now_est().strftime("%I:%M %p ET"),
                 "status":            "ready",
                 "error":             None,
+                "_raw": {
+                    "games":   games,
+                    "sv_bat":  sv_bat,
+                    "sv_pit":  sv_pit,
+                    "xst_bat": xst_bat,
+                    "xst_pit": xst_pit,
+                    "rosters": rosters,
+                },
             })
-        print(f"[Refresh] Done — {len(cands)} candidates, {len(hr_props)} props, lineups={lineups_available}")
+        print("[Refresh] Done — {} candidates, lineups={}".format(len(cands), lineups_available))
     except Exception as e:
         import traceback; traceback.print_exc()
         with _lock:
             _cache["status"] = "error"
             _cache["error"]  = str(e)
+
+# ── Load odds on demand ───────────────────────────────────────────────────────
+
+def load_odds():
+    with _lock:
+        raw = _cache.get("_raw", {})
+        if not raw:
+            return False, "No base data — refresh first"
+
+    print("[Odds] Loading props on demand")
+    hr_props = fetch_hr_props()
+
+    raw     = _cache["_raw"]
+    cands   = build_candidates(
+        raw["games"], hr_props,
+        raw["sv_bat"], raw["sv_pit"],
+        raw["xst_bat"], raw["xst_pit"],
+        raw.get("rosters", {}),
+    )
+
+    with _lock:
+        _cache["candidates"] = cands
+        _cache["with_props"] = sum(1 for c in cands if c["has_prop"])
+        _cache["odds_loaded"] = True
+
+    print("[Odds] {} props, {} candidates with props".format(len(hr_props), _cache["with_props"]))
+    return True, "{} props loaded".format(len(hr_props))
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
@@ -769,7 +819,7 @@ def index():
 
 @app.route("/api/hr")
 def api_hr():
-    if _cache["status"] in ("idle",) or _cache["date"] != today_str():
+    if _cache["status"] == "idle" or _cache["date"] != today_str():
         threading.Thread(target=refresh, daemon=True).start()
         return jsonify({"status": "loading", "message": "Fetching data — refresh in 15s"})
     if _cache["status"] == "refreshing":
@@ -780,7 +830,9 @@ def api_hr():
         "date":              now_est().strftime("%A, %B %d, %Y"),
         "last_refresh":      _cache["last_refresh"],
         "games":             _cache["games"],
+        "games_meta":        _cache["games_meta"],
         "with_props":        _cache["with_props"],
+        "odds_loaded":       _cache["odds_loaded"],
         "lineups_available": _cache.get("lineups_available", False),
         "odds_api_set":      bool(ODDS_API_KEY),
         "total":             len(_cache["candidates"]),
@@ -792,6 +844,18 @@ def api_refresh():
     threading.Thread(target=refresh, args=(True,), daemon=True).start()
     return jsonify({"status": "refresh started"})
 
+@app.route("/api/load-odds", methods=["GET","POST"])
+def api_load_odds():
+    if not ODDS_API_KEY:
+        return jsonify({"error": "ODDS_API_KEY not configured"})
+    if not _cache.get("_raw"):
+        return jsonify({"error": "No base data loaded — refresh first"})
+    ok, msg = load_odds()
+    if ok:
+        return jsonify({"status": "ok", "message": msg,
+                        "with_props": _cache["with_props"], "odds_loaded": True})
+    return jsonify({"error": msg})
+
 @app.route("/api/status")
 def api_status():
     return jsonify({
@@ -799,6 +863,7 @@ def api_status():
         "date":         _cache["date"],
         "total":        len(_cache["candidates"]),
         "with_props":   _cache["with_props"],
+        "odds_loaded":  _cache["odds_loaded"],
         "last_refresh": _cache["last_refresh"],
         "odds_api_set": bool(ODDS_API_KEY),
     })
@@ -809,7 +874,7 @@ HTML = r"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>HR Finder — TwinPicks</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='28' font-size='28'>🏠</text></svg>">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='28' font-size='28'>⚾</text></svg>">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -817,34 +882,77 @@ HTML = r"""<!DOCTYPE html>
 body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
 body::before{content:'';position:fixed;top:-20%;left:-10%;width:50%;height:50%;background:radial-gradient(circle,rgba(245,158,11,.06),transparent 70%);pointer-events:none;z-index:0}
 body::after{content:'';position:fixed;bottom:-15%;right:-10%;width:40%;height:40%;background:radial-gradient(circle,rgba(239,68,68,.04),transparent 70%);pointer-events:none;z-index:0}
-.nav{position:sticky;top:0;z-index:100;background:rgba(6,6,10,.9);backdrop-filter:blur(28px);border-bottom:1px solid var(--b);padding:10px 20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
+/* Nav */
+.nav{position:sticky;top:0;z-index:100;background:rgba(6,6,10,.92);backdrop-filter:blur(28px);border-bottom:1px solid var(--b);padding:10px 20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
 .brand{font-size:16px;font-weight:900;display:flex;align-items:center;gap:8px}
 .brand .tag{font-size:10px;font-weight:700;padding:2px 8px;border-radius:5px;background:rgba(245,158,11,.15);color:var(--gold)}
-.nav-r{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.ftabs{display:flex;gap:3px;background:rgba(255,255,255,.05);padding:3px;border-radius:8px}
-.ftab{padding:5px 12px;border:none;background:transparent;color:var(--dim);font-size:11px;font-weight:600;cursor:pointer;border-radius:5px;font-family:inherit;transition:.15s}
-.ftab.on{background:linear-gradient(135deg,#f59e0b,#d97706);color:#000}
+.nav-r{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .btn{padding:7px 14px;border:none;border-radius:8px;font-weight:700;font-size:11px;cursor:pointer;font-family:inherit;transition:.15s}
 .btn-gold{background:linear-gradient(135deg,#f59e0b,#d97706);color:#000}
 .btn-gold:hover{transform:translateY(-1px);box-shadow:0 4px 14px rgba(245,158,11,.3)}
 .btn-ghost{background:var(--s);color:var(--text);border:1px solid var(--b)}
-.wrap{max-width:1320px;margin:0 auto;padding:16px 20px;position:relative;z-index:1}
+.btn-ghost:hover{background:rgba(255,255,255,.1)}
+.btn-blue{background:rgba(59,130,246,.15);color:#60a5fa;border:1px solid rgba(59,130,246,.25)}
+.btn-blue:hover{background:rgba(59,130,246,.25)}
+.btn-blue.loaded{background:rgba(16,185,129,.12);color:var(--green);border-color:rgba(16,185,129,.25)}
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
+/* Game tabs */
+.tabs-wrap{background:rgba(255,255,255,.02);border-bottom:1px solid var(--b);padding:0 20px;display:flex;align-items:center;gap:0;overflow-x:auto;scrollbar-width:none}
+.tabs-wrap::-webkit-scrollbar{display:none}
+.gtab{display:flex;align-items:center;gap:5px;padding:10px 14px;border:none;background:transparent;color:var(--dim);font-size:11px;font-weight:700;cursor:pointer;font-family:inherit;border-bottom:2px solid transparent;white-space:nowrap;transition:.15s;flex-shrink:0}
+.gtab:hover{color:var(--text)}
+.gtab.on{color:var(--gold);border-bottom-color:var(--gold)}
+.gtab .tlogo{width:20px;height:20px;object-fit:contain;filter:drop-shadow(0 1px 2px rgba(0,0,0,.5))}
+.gtab .tvs{color:var(--dim);font-size:9px;font-weight:600}
+/* Main wrap */
+.wrap{max-width:1360px;margin:0 auto;padding:16px 20px;position:relative;z-index:1}
 .top{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px}
 .ttl{font-size:22px;font-weight:900;background:linear-gradient(135deg,var(--gold),#f87171);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .sub{font-size:11px;color:var(--dim);margin-top:3px}
+/* Stats bar */
 .sbar{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px}
 .sc{background:var(--s);border:1px solid var(--b);border-radius:var(--rs);padding:11px 13px}
 .sl{font-size:9px;font-weight:700;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px}
 .sv{font-size:20px;font-weight:900;font-family:'JetBrains Mono'}
+/* Status msg */
 .stmsg{padding:9px 13px;border-radius:8px;font-size:12px;background:rgba(59,130,246,.08);color:var(--blue);border:1px solid rgba(59,130,246,.15);margin-bottom:12px;display:none}
+/* Pitcher matchup panel */
+.gmatch{background:rgba(255,255,255,.025);border:1px solid var(--b);border-radius:var(--r);padding:14px 16px;margin-bottom:14px}
+.gmatch-hdr{font-size:9px;font-weight:800;color:var(--dim);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:10px}
+.gmatch-teams{display:grid;grid-template-columns:1fr auto 1fr;gap:12px;align-items:start}
+.gmatch-team{display:flex;flex-direction:column;gap:6px}
+.gmatch-team.away{align-items:flex-start}
+.gmatch-team.home{align-items:flex-end}
+.gmatch-ident{display:flex;align-items:center;gap:8px}
+.gmatch-team.home .gmatch-ident{flex-direction:row-reverse}
+.tlogo-lg{width:38px;height:38px;object-fit:contain;filter:drop-shadow(0 2px 4px rgba(0,0,0,.5))}
+.gmatch-tname{font-size:13px;font-weight:800}
+.gmatch-abbr{font-size:11px;color:var(--dim);font-weight:600}
+.gmatch-vs{display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;color:var(--dim);padding-top:12px}
+.sp-card{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);border-radius:9px;padding:9px 11px;min-width:160px}
+.gmatch-team.home .sp-card{text-align:right}
+.sp-name{font-size:12px;font-weight:800;margin-bottom:5px}
+.sp-stats{display:flex;flex-wrap:wrap;gap:5px}
+.gmatch-team.home .sp-stats{justify-content:flex-end}
+.sp-stat{font-size:10px;padding:2px 7px;border-radius:5px;background:rgba(255,255,255,.05);font-family:'JetBrains Mono';font-weight:600}
+.sp-stat.danger{background:rgba(239,68,68,.12);color:var(--red)}
+.sp-stat.warn{background:rgba(245,158,11,.12);color:var(--gold)}
+.sp-tbd{font-size:11px;color:var(--dim);padding:6px 0}
+/* Props toggle */
+.filter-row{display:flex;align-items:center;gap:8px;margin-bottom:12px}
+.ptog{padding:6px 14px;border-radius:7px;border:1px solid var(--b);background:var(--s);color:var(--dim);font-size:11px;font-weight:700;cursor:pointer;font-family:inherit;transition:.15s}
+.ptog.on{background:rgba(245,158,11,.12);color:var(--gold);border-color:rgba(245,158,11,.3)}
+.filter-info{font-size:10px;color:var(--dim)}
+/* Cards */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:11px}
 .card{background:var(--s);border:1px solid var(--b);border-radius:var(--r);padding:15px;transition:.18s;position:relative}
 .card:hover{border-color:rgba(245,158,11,.2);box-shadow:0 0 22px rgba(245,158,11,.06)}
 .card.hasp{border-left:3px solid var(--gold)}
-.card.top{border-color:rgba(245,158,11,.35);background:rgba(245,158,11,.025)}
+.card.xtop{border-color:rgba(245,158,11,.35);background:rgba(245,158,11,.025)}
 .ch{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:9px}
 .pn{font-size:14px;font-weight:800}
-.pm{font-size:10px;color:var(--dim);margin-top:2px}
+.pm{font-size:10px;color:var(--dim);margin-top:2px;display:flex;align-items:center;gap:5px}
+.pm .tmlg{width:14px;height:14px;object-fit:contain}
 .sb{text-align:right}
 .sn{font-size:25px;font-weight:900;font-family:'JetBrains Mono';line-height:1}
 .sl2{font-size:7px;color:var(--dim);letter-spacing:1px;text-transform:uppercase;margin-top:1px}
@@ -872,24 +980,26 @@ body::after{content:'';position:fixed;bottom:-15%;right:-10%;width:40%;height:40
 .sval{font-size:13px;font-weight:800;font-family:'JetBrains Mono'}
 .sigs{margin-top:6px}
 .sig{font-size:9px;padding:1px 0;line-height:1.4}
-.sg{color:var(--green)}.sr{color:var(--red)}.sn2{color:var(--dim)}
+.sg{color:var(--green)}.sr{color:var(--red)}
 .empty{text-align:center;padding:60px 20px;color:var(--dim);font-size:14px}
 .spin{display:inline-block;animation:sp 1s linear infinite}
 @keyframes sp{to{transform:rotate(360deg)}}
+.c-green{color:var(--green)}.c-gold{color:var(--gold)}.c-red{color:var(--red)}
 footer{text-align:center;padding:20px;font-size:10px;color:rgba(255,255,255,.12)}
 ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:3px}
-@media(max-width:600px){.sbar{grid-template-columns:repeat(2,1fr)}.s4{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:600px){.sbar{grid-template-columns:repeat(2,1fr)}.s4{grid-template-columns:repeat(2,1fr)}.gmatch-teams{grid-template-columns:1fr;gap:8px}.gmatch-vs{padding:0}}
 </style></head><body>
+
 <div class="nav">
   <div class="brand">⚾ HR Finder <span class="tag">TWINPICKS</span></div>
   <div class="nav-r">
-    <div class="ftabs">
-      <button class="ftab on" data-f="props">PROPS ONLY</button>
-      <button class="ftab" data-f="all">ALL PLAYERS</button>
-    </div>
+    <button class="btn btn-blue" id="oddsBtn" onclick="doLoadOdds()">📊 Load Odds</button>
     <button class="btn btn-gold" onclick="doRefresh()">↺ Refresh</button>
   </div>
 </div>
+
+<div class="tabs-wrap" id="gtabs"></div>
+
 <div class="wrap">
   <div class="top">
     <div><div class="ttl">Home Run Finder</div><div class="sub" id="sub"></div></div>
@@ -897,136 +1007,331 @@ footer{text-align:center;padding:20px;font-size:10px;color:rgba(255,255,255,.12)
   </div>
   <div class="sbar" id="sbar"></div>
   <div class="stmsg" id="stmsg"></div>
+  <div id="gmatch"></div>
+  <div class="filter-row">
+    <button class="ptog" id="ptog" onclick="toggleProps()">PROPS ONLY: OFF</button>
+    <span class="filter-info" id="finfo"></span>
+  </div>
   <div id="out"><div class="empty"><span class="spin">⚾</span><br><br>Loading HR data...</div></div>
 </div>
 <footer>TwinPicks HR Finder — Statcast · Starting Pitcher · Sportsbook</footer>
+
 <script>
-var D=null,filt='props',_pt=null,ODDS_API_KEY_SET=false;
-document.querySelectorAll('.ftab').forEach(function(b){b.addEventListener('click',function(){
-  document.querySelectorAll('.ftab').forEach(function(x){x.classList.remove('on')});
-  b.classList.add('on');filt=b.dataset.f;if(D)render(D);
-})});
-function N(v,d){var f=parseFloat(v);return isNaN(f)?0:(d!==undefined?f.toFixed(d):f)}
-function f3(v){var f=N(v);return f>0?'.'+String(Math.round(f*1000)).padStart(3,'0'):'—'}
-function fOdds(v){return v>0?'+'+v:(v<0?String(v):'—')}
-function cEV(v){return N(v)>=91?'c-green':N(v)>=89?'c-gold':N(v)>0&&N(v)<86?'c-red':''}
-function cBrl(v){return N(v)>=12?'c-green':N(v)>=8?'c-gold':''}
-function cLA(v){var la=N(v);return la>=18&&la<=28?'c-green':la>=14&&la<=32?'c-gold':la>0?'c-red':''}
-function cHH(v){return N(v)>=48?'c-green':N(v)>=42?'c-gold':''}
-function cISO(v){return N(v)>=0.220?'c-green':N(v)>=0.170?'c-gold':''}
-function cXW(v){return N(v)>=0.380?'c-green':N(v)>=0.320?'c-gold':N(v)>0&&N(v)<0.280?'c-red':''}
-function cPull(v){return N(v)>=48?'c-green':N(v)>=40?'c-gold':''}
-function cFB(v){return N(v)>=44?'c-green':N(v)>=36?'c-gold':''}
-function cSS(v){return N(v)>=38?'c-green':N(v)>=28?'c-gold':''}
-function cGB(v){return N(v)>=55?'c-red':N(v)>=45?'c-gold':''}
-function cScore(v){return N(v)>=12?'var(--green)':N(v)>=8?'var(--gold)':N(v)>=4?'var(--text)':'var(--dim)'}
-function zbcls(z){return z==='A'?'zA':z==='B+'?'zBp':z==='B'?'zB':z==='C'?'zC':'zD'}
-function css(c){return c?(' class="'+c+'"'):''} // helper for coloring
-function box(lbl,val,c){return'<div class="sbox"><div class="slbl">'+lbl+'</div><div class="sval'+(c?' '+c:'')+'">'+(val||'—')+'</div></div>'}
+var D = null;
+var activeGame = -1;   // -1 = ALL, 0..n = game index
+var propsOnly = false;
+var _pollTimer = null;
+var ODDS_API_SET = false;
 
-function render(d){
-  var cands=d.candidates||[];
-  if(filt==='props')cands=cands.filter(function(c){return c.has_prop});
-  var sb='';
-  sb+='<div class="sc"><div class="sl">Games</div><div class="sv">'+(d.games||0)+'</div></div>';
-  sb+='<div class="sc"><div class="sl">With Props</div><div class="sv" style="color:var(--gold)">'+(d.with_props||0)+'</div></div>';
-  sb+='<div class="sc"><div class="sl">Analyzed</div><div class="sv">'+(d.total||0)+'</div></div>';
-  sb+='<div class="sc"><div class="sl">Showing</div><div class="sv">'+cands.length+'</div></div>';
-  document.getElementById('sbar').innerHTML=sb;
-  document.getElementById('sub').textContent=d.date||'';
-  var lrParts=[];
-  if(d.last_refresh)lrParts.push('Refreshed '+d.last_refresh);
-  if(!d.lineups_available)lrParts.push('⚠ Lineups not posted — using rosters');
-  if(!d.with_props&&ODDS_API_KEY_SET)lrParts.push('⚠ No sportsbook lines yet');
-  document.getElementById('lr').textContent=lrParts.join(' · ');
-  if(!cands.length){
-    var msg=filt==='props'?'No HR props loaded — switch to All Players or add ODDS_API_KEY env var.':'No players found. Rosters/lineups may still be loading.';
-    document.getElementById('out').innerHTML='<div class="empty">'+msg+'</div>';return}
-  var h='<div class="grid">';
-  for(var i=0;i<cands.length;i++){
-    var c=cands[i],st=c.statcast||{},pr=c.prop,pi=c.pitcher||{},sc=c.hr_score;
-    var isTop=sc>=12&&c.has_prop;
-    h+='<div class="card'+(c.has_prop?' hasp':'')+(isTop?' top':'')+'">';
-    // Header
-    h+='<div class="ch"><div><div class="pn">'+c.player+'</div><div class="pm">'+(c.team||''+(c.game?' · '+c.game:''))+'</div></div>';
-    h+='<div class="sb"><div class="sn" style="color:'+cScore(sc)+'">'+sc+'</div><div class="sl2">HR Score</div></div></div>';
-    // Badges
-    h+='<div class="bdg">';
-    var zf=c.zone_fit||'?';h+='<span class="b '+zbcls(zf)+'">ZONE '+zf+'</span>';
-    var pfc=c.park_factor>=1.05?'pf-g':c.park_factor<=0.95?'pf-b':'pf-n';
-    h+='<span class="b '+pfc+'">PF '+N(c.park_factor,2)+'</span>';
-    if(c.has_prop)h+='<span class="b b-prop">SPORTSBOOK</span>';
-    if(pr&&pr.edge!==null&&pr.edge!==undefined){var ec=pr.edge>3?'var(--green)':pr.edge>0?'var(--gold)':'var(--red)';h+='<span class="b" style="background:rgba(255,255,255,.05);color:'+ec+'">'+(pr.edge>0?'+':'')+pr.edge+'% edge</span>'}
-    h+='</div>';
-    // Prop
-    if(pr){
-      h+='<div class="pbox"><div class="pl"><span style="font-size:12px;font-weight:800;color:var(--gold)">HR '+N(pr.line,1)+'</span>'+(pr.implied_pct?'<span style="font-size:10px;color:var(--dim)">Implied: '+pr.implied_pct+'%</span>':'')+'</div>';
-      h+='<div class="po">';
-      if(pr.over_odds)h+='<span style="color:var(--green)">O '+fOdds(pr.over_odds)+'</span>';
-      if(pr.under_odds)h+='<span style="color:var(--red)">U '+fOdds(pr.under_odds)+'</span>';
-      h+='<span style="color:var(--dim)">Model: '+N(pr.model_pct,0)+'%</span>';
-      h+='</div></div>';
-    }
-    // Pitcher
-    if(pi.name){
-      h+='<div class="pibox"><div class="pin">vs '+pi.name+'</div><div class="pis">';
-      if(pi.era)h+='<span>'+N(pi.era,2)+' ERA</span>';
-      if(pi.hr_per_9)h+='<span style="color:'+(N(pi.hr_per_9)>=1.5?'var(--red)':N(pi.hr_per_9)>=1.0?'var(--gold)':'inherit')+'">'+N(pi.hr_per_9,2)+' HR/9</span>';
-      if(pi.hr_allowed)h+='<span>'+pi.hr_allowed+' HR allowed</span>';
-      if(pi.ip)h+='<span>'+N(pi.ip,1)+' IP</span>';
-      if(pi.barrel_allowed)h+='<span>'+N(pi.barrel_allowed,1)+'% BRL all.</span>';
-      if(pi.xera)h+='<span>'+N(pi.xera,2)+' xERA</span>';
-      h+='</div></div>';
-    }
-    // Row 1: Raw power
-    h+='<div class="srow s4">';
-    h+=box('EV',N(st.ev)>0?N(st.ev,1):'—',cEV(st.ev));
-    h+=box('BRL%',N(st.barrel)>0?N(st.barrel,1)+'%':'—',cBrl(st.barrel));
-    h+=box('LA°',N(st.la)!==0?N(st.la,0)+'°':'—',cLA(st.la));
-    h+=box('HH%',N(st.hard_hit)>0?N(st.hard_hit,0)+'%':'—',cHH(st.hard_hit));
-    h+='</div>';
-    // Row 2: Expected / quality
-    h+='<div class="srow s4">';
-    h+=box('ISO',N(st.iso)>0?f3(st.iso):'—',cISO(st.iso));
-    h+=box('xwOBA',N(st.xwoba)>0?f3(st.xwoba):'—',cXW(st.xwoba));
-    h+=box('xSLG',N(st.xslg)>0?f3(st.xslg):'—',N(st.xslg)>=0.500?'c-green':N(st.xslg)>=0.400?'c-gold':'');
-    h+=box('BIP',N(st.bip)>0?st.bip:'—','');
-    h+='</div>';
-    // Row 3: Spray / batted ball
-    h+='<div class="srow s4">';
-    h+=box('PULL%',N(st.pull_pct)>0?N(st.pull_pct,0)+'%':'—',cPull(st.pull_pct));
-    h+=box('FB%',N(st.fb_pct)>0?N(st.fb_pct,0)+'%':'—',cFB(st.fb_pct));
-    h+=box('SS%',N(st.sweet_spot)>0?N(st.sweet_spot,0)+'%':'—',cSS(st.sweet_spot));
-    h+=box('GB%',N(st.gb_pct)>0?N(st.gb_pct,0)+'%':'—',cGB(st.gb_pct));
-    h+='</div>';
-    // Signals
-    if(c.signals&&c.signals.length){h+='<div class="sigs">';for(var s=0;s<Math.min(c.signals.length,4);s++){var sg=c.signals[s];var sgc=sg.indexOf('unlikely')>=0||sg.indexOf('Low EV')>=0||sg.indexOf('Pitcher park')>=0||sg.indexOf('suppressor')>=0?'sr':'sg';h+='<div class="sig '+sgc+'">● '+sg+'</div>'}h+='</div>'}
-    h+='</div>';
+function N(v,d){var f=parseFloat(v);if(isNaN(f))return 0;return d!==undefined?parseFloat(f.toFixed(d)):f;}
+function f3(v){var f=N(v);return f>0?'.'+String(Math.round(f*1000)).padStart(3,'0'):'—';}
+function fOdds(v){return v>0?'+'+v:(v<0?String(v):'—');}
+function cEV(v){return N(v)>=91?'c-green':N(v)>=89?'c-gold':N(v)>0&&N(v)<86?'c-red':'';}
+function cBrl(v){return N(v)>=12?'c-green':N(v)>=8?'c-gold':'';}
+function cLA(v){var la=N(v);return la>=18&&la<=28?'c-green':la>=14&&la<=32?'c-gold':la>0?'c-red':'';}
+function cHH(v){return N(v)>=48?'c-green':N(v)>=42?'c-gold':'';}
+function cISO(v){return N(v)>=0.220?'c-green':N(v)>=0.170?'c-gold':'';}
+function cXW(v){return N(v)>=0.380?'c-green':N(v)>=0.320?'c-gold':N(v)>0&&N(v)<0.280?'c-red':'';}
+function cPull(v){return N(v)>=48?'c-green':N(v)>=40?'c-gold':'';}
+function cFB(v){return N(v)>=44?'c-green':N(v)>=36?'c-gold':'';}
+function cSS(v){return N(v)>=38?'c-green':N(v)>=28?'c-gold':'';}
+function cGB(v){return N(v)>=55?'c-red':N(v)>=45?'c-gold':'';}
+function cScore(v){return N(v)>=12?'var(--green)':N(v)>=8?'var(--gold)':N(v)>=4?'var(--text)':'var(--dim)';}
+function zbcls(z){return z==='A'?'zA':z==='B+'?'zBp':z==='B'?'zB':z==='C'?'zC':'zD';}
+function box(lbl,val,c){return '<div class="sbox"><div class="slbl">'+lbl+'</div><div class="sval'+(c?' '+c:'')+'">'+(val||'—')+'</div></div>';}
+
+function setGame(idx, el) {
+  document.querySelectorAll('.gtab').forEach(function(b){b.classList.remove('on');});
+  el.classList.add('on');
+  activeGame = idx;
+  if (D) render(D);
+}
+
+function toggleProps() {
+  propsOnly = !propsOnly;
+  var btn = document.getElementById('ptog');
+  btn.textContent = propsOnly ? 'PROPS ONLY: ON' : 'PROPS ONLY: OFF';
+  btn.classList.toggle('on', propsOnly);
+  if (D) render(D);
+}
+
+function buildTabs(meta) {
+  var h = '<button class="gtab'+(activeGame===-1?' on':'')+'" onclick="setGame(-1,this)">ALL GAMES</button>';
+  for (var i = 0; i < meta.length; i++) {
+    var g = meta[i];
+    h += '<button class="gtab'+(activeGame===i?' on':'')+'" onclick="setGame('+i+',this)">';
+    h += '<img src="'+g.away_logo+'" class="tlogo" onerror="this.style.display=\'none\'" alt="'+g.away_abbr+'">';
+    h += '<span>'+g.away_abbr+'</span>';
+    h += '<span class="tvs">@</span>';
+    h += '<span>'+g.home_abbr+'</span>';
+    h += '<img src="'+g.home_logo+'" class="tlogo" onerror="this.style.display=\'none\'" alt="'+g.home_abbr+'">';
+    h += '</button>';
   }
-  h+='</div>';
-  document.getElementById('out').innerHTML=h;
+  document.getElementById('gtabs').innerHTML = h;
 }
 
-function doRefresh(){
-  var st=document.getElementById('stmsg');st.style.display='block';st.textContent='Refreshing all data...';
-  fetch('/api/refresh',{method:'POST'}).then(function(){setTimeout(load,2000)});
+function spStat(label, val, cls) {
+  if (!val || N(val) === 0) return '';
+  return '<span class="sp-stat'+(cls?' '+cls:'')+'">' + label + ' ' + val + '</span>';
 }
 
-function load(){
-  fetch('/api/hr').then(function(r){return r.json()}).then(function(d){
-    if(d.status==='loading'){
-      var st=document.getElementById('stmsg');st.style.display='block';st.textContent=d.message||'Loading...';
-      if(!_pt)_pt=setInterval(load,5000);return;
+function renderMatchupPanel(meta) {
+  var el = document.getElementById('gmatch');
+  if (activeGame < 0 || !meta || activeGame >= meta.length) { el.innerHTML = ''; return; }
+  var g = meta[activeGame];
+
+  function spHtml(sp, isHome) {
+    if (!sp || sp.name === 'TBD') return '<div class="sp-tbd">SP: TBD</div>';
+    var h9 = N(sp.hr_per_9);
+    var h = '<div class="sp-card"><div class="sp-name">'+sp.name+'</div><div class="sp-stats">';
+    if (sp.era) h += spStat('ERA', N(sp.era,2), '');
+    if (sp.xera) h += spStat('xERA', N(sp.xera,2), '');
+    if (sp.whip) h += spStat('WHIP', N(sp.whip,2), '');
+    if (sp.k9) h += spStat('K/9', N(sp.k9,1), '');
+    if (h9) h += spStat('HR/9', N(h9,2), h9>=1.5?'danger':h9>=1.0?'warn':'');
+    if (sp.hr_allowed) h += spStat(sp.hr_allowed+' HR', '', '');
+    if (sp.ip) h += spStat(N(sp.ip,1)+' IP', '', '');
+    if (sp.barrel_allowed) h += spStat(N(sp.barrel_allowed,1)+'% BRL', '', '');
+    h += '</div></div>';
+    return h;
+  }
+
+  var h = '<div class="gmatch">';
+  h += '<div class="gmatch-hdr">Pitching Matchup</div>';
+  h += '<div class="gmatch-teams">';
+
+  // Away
+  h += '<div class="gmatch-team away">';
+  h += '<div class="gmatch-ident">';
+  h += '<img src="'+g.away_logo+'" class="tlogo-lg" onerror="this.style.display=\'none\'" alt="'+g.away_abbr+'">';
+  h += '<div><div class="gmatch-tname">'+g.away_name+'</div><div class="gmatch-abbr">Away</div></div>';
+  h += '</div>';
+  h += spHtml(g.away_sp, false);
+  h += '</div>';
+
+  // VS
+  h += '<div class="gmatch-vs">VS</div>';
+
+  // Home
+  h += '<div class="gmatch-team home">';
+  h += '<div class="gmatch-ident">';
+  h += '<div style="text-align:right"><div class="gmatch-tname">'+g.home_name+'</div><div class="gmatch-abbr">Home</div></div>';
+  h += '<img src="'+g.home_logo+'" class="tlogo-lg" onerror="this.style.display=\'none\'" alt="'+g.home_abbr+'">';
+  h += '</div>';
+  h += spHtml(g.home_sp, true);
+  h += '</div>';
+
+  h += '</div></div>';
+  el.innerHTML = h;
+}
+
+function render(d) {
+  var meta   = d.games_meta || [];
+  var cands  = d.candidates || [];
+
+  buildTabs(meta);
+  renderMatchupPanel(meta);
+
+  // Filter by game
+  if (activeGame >= 0 && activeGame < meta.length) {
+    var glbl = meta[activeGame].label;
+    cands = cands.filter(function(c){ return c.game === glbl; });
+  }
+
+  // Filter by props
+  if (propsOnly) {
+    cands = cands.filter(function(c){ return c.has_prop; });
+  }
+
+  // Stats bar
+  var showing = cands.length;
+  var sb = '';
+  sb += '<div class="sc"><div class="sl">Games</div><div class="sv">'+(d.games||0)+'</div></div>';
+  sb += '<div class="sc"><div class="sl">With Props</div><div class="sv" style="color:var(--gold)">'+(d.with_props||0)+'</div></div>';
+  sb += '<div class="sc"><div class="sl">Analyzed</div><div class="sv">'+(d.total||0)+'</div></div>';
+  sb += '<div class="sc"><div class="sl">Showing</div><div class="sv">'+showing+'</div></div>';
+  document.getElementById('sbar').innerHTML = sb;
+  document.getElementById('sub').textContent = d.date || '';
+
+  // Last refresh / warnings
+  var lrParts = [];
+  if (d.last_refresh) lrParts.push('Refreshed '+d.last_refresh);
+  if (!d.lineups_available) lrParts.push('Lineups not posted — using rosters');
+  if (d.odds_loaded) lrParts.push('Odds loaded');
+  document.getElementById('lr').textContent = lrParts.join(' · ');
+
+  // Filter info
+  var fi = document.getElementById('finfo');
+  fi.textContent = propsOnly && !d.odds_loaded ? 'Load Odds first to see props' :
+                   propsOnly ? showing+' players with sportsbook lines' : '';
+
+  // Cards
+  if (!cands.length) {
+    var msg = propsOnly ? 'No props — click Load Odds or turn off Props Only filter.' :
+              activeGame >= 0 ? 'No players found for this game yet.' :
+              'No players found. Rosters/lineups may still be loading.';
+    document.getElementById('out').innerHTML = '<div class="empty">'+msg+'</div>';
+    return;
+  }
+
+  var h = '<div class="grid">';
+  for (var i = 0; i < cands.length; i++) {
+    var c = cands[i], st = c.statcast||{}, pr = c.prop, pi = c.pitcher||{}, sc2 = c.hr_score;
+    var isTop = sc2 >= 12 && c.has_prop;
+    h += '<div class="card'+(c.has_prop?' hasp':'')+(isTop?' xtop':'')+'">';
+
+    // Header
+    var teamLogo = '';
+    if (c.abbr && meta.length) {
+      for (var gi = 0; gi < meta.length; gi++) {
+        var gm = meta[gi];
+        if (gm.away_abbr === c.abbr) { teamLogo = gm.away_logo; break; }
+        if (gm.home_abbr === c.abbr) { teamLogo = gm.home_logo; break; }
+      }
     }
-    if(_pt){clearInterval(_pt);_pt=null}
-    document.getElementById('stmsg').style.display='none';
-    if(d.error){document.getElementById('out').innerHTML='<div class="empty">'+d.error+'</div>';return}
-    D=d;if(d.odds_api_set!==undefined)ODDS_API_KEY_SET=d.odds_api_set;render(d);
-  }).catch(function(){document.getElementById('out').innerHTML='<div class="empty">Error. <a href="javascript:load()" style="color:var(--blue)">Retry</a></div>'});
+    h += '<div class="ch"><div><div class="pn">'+c.player+'</div>';
+    h += '<div class="pm">';
+    if (teamLogo) h += '<img src="'+teamLogo+'" class="tmlg" onerror="this.style.display=\'none\'" alt="">';
+    h += (c.team||c.abbr||'')+(c.game?' · '+c.game:'')+'</div></div>';
+    h += '<div class="sb"><div class="sn" style="color:'+cScore(sc2)+'">'+sc2+'</div><div class="sl2">HR Score</div></div></div>';
+
+    // Badges
+    h += '<div class="bdg">';
+    var zf = c.zone_fit||'?'; h += '<span class="b '+zbcls(zf)+'">ZONE '+zf+'</span>';
+    var pfc = c.park_factor>=1.05?'pf-g':c.park_factor<=0.95?'pf-b':'pf-n';
+    h += '<span class="b '+pfc+'">PF '+N(c.park_factor,2)+'</span>';
+    if (c.has_prop) h += '<span class="b b-prop">SPORTSBOOK</span>';
+    if (pr && pr.edge!==null && pr.edge!==undefined) {
+      var ec = pr.edge>3?'var(--green)':pr.edge>0?'var(--gold)':'var(--red)';
+      h += '<span class="b" style="background:rgba(255,255,255,.05);color:'+ec+'">'+(pr.edge>0?'+':'')+pr.edge+'% edge</span>';
+    }
+    h += '</div>';
+
+    // Prop box
+    if (pr) {
+      h += '<div class="pbox"><div class="pl"><span style="font-size:12px;font-weight:800;color:var(--gold)">HR '+N(pr.line,1)+'</span>'+(pr.implied_pct?'<span style="font-size:10px;color:var(--dim)">Implied: '+pr.implied_pct+'%</span>':'')+'</div>';
+      h += '<div class="po">';
+      if (pr.over_odds) h += '<span style="color:var(--green)">O '+fOdds(pr.over_odds)+'</span>';
+      if (pr.under_odds) h += '<span style="color:var(--red)">U '+fOdds(pr.under_odds)+'</span>';
+      h += '<span style="color:var(--dim)">Model: '+N(pr.model_pct,0)+'%</span>';
+      h += '</div></div>';
+    }
+
+    // Pitcher — only show in ALL tab to avoid redundancy in game tabs
+    if (pi.name && activeGame < 0) {
+      h += '<div class="pibox"><div class="pin">vs '+pi.name+'</div><div class="pis">';
+      if (pi.era) h += '<span>'+N(pi.era,2)+' ERA</span>';
+      if (pi.hr_per_9) h += '<span style="color:'+(N(pi.hr_per_9)>=1.5?'var(--red)':N(pi.hr_per_9)>=1.0?'var(--gold)':'inherit')+'">'+N(pi.hr_per_9,2)+' HR/9</span>';
+      if (pi.hr_allowed) h += '<span>'+pi.hr_allowed+' HR allowed</span>';
+      if (pi.ip) h += '<span>'+N(pi.ip,1)+' IP</span>';
+      if (pi.barrel_allowed) h += '<span>'+N(pi.barrel_allowed,1)+'% BRL</span>';
+      if (pi.xera) h += '<span>'+N(pi.xera,2)+' xERA</span>';
+      if (pi.k9) h += '<span>'+N(pi.k9,1)+' K/9</span>';
+      h += '</div></div>';
+    }
+
+    // Statcast rows
+    h += '<div class="srow s4">';
+    h += box('EV',   N(st.ev)>0?N(st.ev,1):'—',        cEV(st.ev));
+    h += box('BRL%', N(st.barrel)>0?N(st.barrel,1)+'%':'—', cBrl(st.barrel));
+    h += box('LA°',  N(st.la)!==0?N(st.la,0)+'°':'—',  cLA(st.la));
+    h += box('HH%',  N(st.hard_hit)>0?N(st.hard_hit,0)+'%':'—', cHH(st.hard_hit));
+    h += '</div>';
+    h += '<div class="srow s4">';
+    h += box('ISO',   N(st.iso)>0?f3(st.iso):'—',   cISO(st.iso));
+    h += box('xwOBA', N(st.xwoba)>0?f3(st.xwoba):'—', cXW(st.xwoba));
+    h += box('xSLG',  N(st.xslg)>0?f3(st.xslg):'—', N(st.xslg)>=0.500?'c-green':N(st.xslg)>=0.400?'c-gold':'');
+    h += box('BIP',   N(st.bip)>0?st.bip:'—', '');
+    h += '</div>';
+    h += '<div class="srow s4">';
+    h += box('PULL%', N(st.pull_pct)>0?N(st.pull_pct,0)+'%':'—', cPull(st.pull_pct));
+    h += box('FB%',   N(st.fb_pct)>0?N(st.fb_pct,0)+'%':'—',    cFB(st.fb_pct));
+    h += box('SS%',   N(st.sweet_spot)>0?N(st.sweet_spot,0)+'%':'—', cSS(st.sweet_spot));
+    h += box('GB%',   N(st.gb_pct)>0?N(st.gb_pct,0)+'%':'—',    cGB(st.gb_pct));
+    h += '</div>';
+
+    // Signals
+    if (c.signals && c.signals.length) {
+      h += '<div class="sigs">';
+      for (var s=0; s<Math.min(c.signals.length,4); s++) {
+        var sg = c.signals[s];
+        var sgc = sg.indexOf('unlikely')>=0||sg.indexOf('Low EV')>=0||sg.indexOf('Pitcher park')>=0||sg.indexOf('suppressor')>=0?'sr':'sg';
+        h += '<div class="sig '+sgc+'">● '+sg+'</div>';
+      }
+      h += '</div>';
+    }
+    h += '</div>';
+  }
+  h += '</div>';
+  document.getElementById('out').innerHTML = h;
 }
+
+function doLoadOdds() {
+  var btn = document.getElementById('oddsBtn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Fetching...';
+  fetch('/api/load-odds', {method:'POST'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      btn.disabled = false;
+      if (d.error) {
+        btn.textContent = '📊 Load Odds';
+        var st = document.getElementById('stmsg');
+        st.style.display = 'block';
+        st.textContent = 'Odds error: ' + d.error;
+        return;
+      }
+      btn.textContent = '✓ ' + (d.with_props||0) + ' Props';
+      btn.classList.add('loaded');
+      load();
+    })
+    .catch(function(){
+      btn.disabled = false;
+      btn.textContent = '📊 Load Odds';
+    });
+}
+
+function doRefresh() {
+  var st = document.getElementById('stmsg');
+  st.style.display = 'block';
+  st.textContent = 'Refreshing all data...';
+  var btn = document.getElementById('oddsBtn');
+  btn.textContent = '📊 Load Odds';
+  btn.classList.remove('loaded');
+  btn.disabled = false;
+  fetch('/api/refresh', {method:'POST'}).then(function(){setTimeout(load, 2000);});
+}
+
+function load() {
+  fetch('/api/hr').then(function(r){return r.json();}).then(function(d){
+    if (d.status === 'loading') {
+      var st = document.getElementById('stmsg');
+      st.style.display = 'block';
+      st.textContent = d.message || 'Loading...';
+      if (!_pollTimer) _pollTimer = setInterval(load, 5000);
+      return;
+    }
+    if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
+    document.getElementById('stmsg').style.display = 'none';
+    if (d.error) {
+      document.getElementById('out').innerHTML = '<div class="empty">'+d.error+'</div>';
+      return;
+    }
+    ODDS_API_SET = d.odds_api_set || false;
+    // Update odds btn if odds already loaded (e.g. page reload)
+    if (d.odds_loaded) {
+      var btn = document.getElementById('oddsBtn');
+      btn.textContent = '✓ '+(d.with_props||0)+' Props';
+      btn.classList.add('loaded');
+    }
+    D = d;
+    render(d);
+  }).catch(function(){
+    document.getElementById('out').innerHTML = '<div class="empty">Error loading. <a href="javascript:load()" style="color:var(--blue)">Retry</a></div>';
+  });
+}
+
 load();
-// CSS color classes for stat values
-document.head.insertAdjacentHTML('beforeend','<style>.c-green{color:var(--green)}.c-gold{color:var(--gold)}.c-red{color:var(--red)}.c-blue{color:var(--blue)}</style>');
 </script></body></html>"""
 
 # ── Boot ──────────────────────────────────────────────────────────────────────
