@@ -107,6 +107,8 @@ def fetch_games(date=None):
                 "away_abbr":    aa,
                 "home_team":    ht.get("name", ""),
                 "away_team":    at.get("name", ""),
+                "home_id":      ht.get("id"),
+                "away_id":      at.get("id"),
                 "park_factor":  PARK_FACTORS.get(ha, 1.0),
                 "home_sp":      {"id": hsp.get("id"), "name": hsp.get("fullName", "")},
                 "away_sp":      {"id": asp.get("id"), "name": asp.get("fullName", "")},
@@ -140,6 +142,15 @@ def fetch_pitcher_stats(pid):
             "gs":         _i(s.get("gamesStarted", 0)),
         }
     return {}
+
+def fetch_roster(team_id):
+    """Fetch active roster for a team. Returns list of player fullNames."""
+    if not team_id:
+        return []
+    year = now_est().year
+    d = _mlb_get(f"{MLB}/teams/{team_id}/roster?rosterType=active&season={year}")
+    return [p.get("person",{}).get("fullName","") for p in d.get("roster",[]) if p.get("person",{}).get("fullName")]
+
 
 def fetch_batter_recent(bid):
     if not bid:
@@ -207,6 +218,46 @@ def _sv_csv(url, label):
     except Exception as e:
         print(f"[{label}] parse error: {e}")
         return None, None
+
+def fetch_savant_spray(year=None, min_pa=30):
+    """Fetch pull%, FB%, GB%, LD%, oppo% from Savant Custom Leaderboard.
+    These columns do NOT exist in the standard EV leaderboard CSV."""
+    year = year or now_est().year
+    selections = "b_total_pa,pull_percent,opposite_percent,groundballs_percent,flyballs_percent,linedrives_percent,popups_percent"
+    url = (f"https://baseballsavant.mlb.com/leaderboard/custom"
+           f"?year={year}&type=batter&filter=&sort=4&sportId=1"
+           f"&startInning=1&endInning=9&min={min_pa}"
+           f"&selections={selections}"
+           f"&chart=false&x=b_total_pa&y=pull_percent&r=no&chartType=beeswarm&csv=true")
+    fn, rows = _sv_csv(url, f"SV-Spray")
+    if not fn or not rows:
+        if year == now_est().year:
+            return fetch_savant_spray(year - 1, min_pa)
+        return {}
+
+    nc = _sv_col(fn, "last_name, first_name", "player_name", "name")
+    fc = _sv_col(fn, "first_name", "name_first")
+    lc = _sv_col(fn, "last_name",  "name_last")
+    cols = {
+        "pull": _sv_col(fn, "pull_percent"),
+        "oppo": _sv_col(fn, "opposite_percent"),
+        "gb":   _sv_col(fn, "groundballs_percent"),
+        "fb":   _sv_col(fn, "flyballs_percent"),
+        "ld":   _sv_col(fn, "linedrives_percent"),
+    }
+    print(f"[SV-Spray] cols: pull={cols['pull']} fb={cols['fb']} gb={cols['gb']}")
+    out = {}
+    for r in rows:
+        try:
+            name = _sv_name(r, nc, fc, lc)
+            if not name or len(name) < 3:
+                continue
+            out[name] = {k: _f(_sv_get(r, cols[k])) for k in cols if cols[k]}
+        except Exception:
+            continue
+    print(f"[SV-Spray] {len(out)} players")
+    return out
+
 
 def fetch_savant_ev(ptype="batter", year=None, min_bbe=50):
     year = year or now_est().year
@@ -304,7 +355,9 @@ def fetch_hr_props():
 
     today = today_str()
     events = [e for e in events if e.get("commence_time","").startswith(today)]
+    print(f"[Odds] {len(events)} events for {today}")
     props = {}
+    _logged_sample = False
     for event in events[:20]:
         eid = event.get("id")
         if not eid:
@@ -317,6 +370,16 @@ def fetch_hr_props():
             req.add_header("User-Agent", "TwinPicks-HRFinder/1.0")
             with urllib.request.urlopen(req, timeout=15) as r:
                 data = json.loads(r.read().decode())
+
+            # Log the first event response for debugging
+            if not _logged_sample:
+                bks = data.get("bookmakers", [])
+                mkts = bks[0].get("markets", []) if bks else []
+                print(f"[Odds] Sample event '{event.get('away_team')} @ {event.get('home_team')}'"
+                      f" — bookmakers: {len(bks)}, markets: {[m.get('key') for m in mkts]}"
+                      f", outcomes: {len(mkts[0].get('outcomes',[])) if mkts else 0}")
+                _logged_sample = True
+
             glabel = event.get("away_team","") + " @ " + event.get("home_team","")
             for bk in data.get("bookmakers", []):
                 for mkt in bk.get("markets", []):
@@ -497,7 +560,7 @@ def zone_fit(bsv, bxst):
 
 # ── Build candidates ──────────────────────────────────────────────────────────
 
-def build_candidates(games, hr_props, sv_bat, sv_pit, xst_bat, xst_pit):
+def build_candidates(games, hr_props, sv_bat, sv_pit, xst_bat, xst_pit, rosters=None):
     player_map = {}  # name -> {game, team, opp_sp, park_factor}
     for g in games:
         pf = g["park_factor"]
@@ -508,6 +571,21 @@ def build_candidates(games, hr_props, sv_bat, sv_pit, xst_bat, xst_pit):
         for name in g["home_lineup"]:
             player_map[name] = {"game": g["label"], "team": g["home_team"],
                                 "abbr": g["home_abbr"], "opp_sp": asp, "pf": pf}
+
+    # Fallback: use rosters when lineups aren't posted yet
+    if rosters and not player_map:
+        print(f"[Build] Lineups empty — using rosters ({sum(len(v) for v in rosters.values())} players)")
+        for g in games:
+            pf = g["park_factor"]
+            hsp, asp = g["home_sp"], g["away_sp"]
+            for name in rosters.get(g["home_abbr"], []):
+                if name not in player_map:
+                    player_map[name] = {"game": g["label"], "team": g["home_team"],
+                                        "abbr": g["home_abbr"], "opp_sp": asp, "pf": pf}
+            for name in rosters.get(g["away_abbr"], []):
+                if name not in player_map:
+                    player_map[name] = {"game": g["label"], "team": g["away_team"],
+                                        "abbr": g["away_abbr"], "opp_sp": hsp, "pf": pf}
 
     # Prop players not yet in lineup — guess from game label
     for pname, pdata in hr_props.items():
@@ -520,7 +598,9 @@ def build_candidates(games, hr_props, sv_bat, sv_pit, xst_bat, xst_pit):
                                      "opp_sp": g["home_sp"], "pf": g["park_factor"]}
                 break
 
+    # Build pool: props first, then all mapped players (roster/lineup)
     pool = set(list(hr_props.keys()) + list(player_map.keys()))
+    print(f"[Build] pool={len(pool)} player_map={len(player_map)} props={len(hr_props)}")
     cands = []
     for pname in pool:
         bsv  = _match(pname, sv_bat)  or {}
@@ -626,7 +706,17 @@ def refresh(force=False):
         xst_bat  = fetch_savant_xstats("batter")
         xst_pit  = fetch_savant_xstats("pitcher", min_pa=25)
 
-        # Fetch MLB pitcher stats and inject into sv_pit
+        # Spray data (pull%, FB%, GB%) — separate Savant endpoint
+        spray = fetch_savant_spray()
+        for name, sp_data in spray.items():
+            matched = _match(name, sv_bat)
+            if matched is not None:
+                matched.update(sp_data)
+            else:
+                sv_bat[name] = sp_data
+        print(f"[Refresh] Spray merged into {len(sv_bat)} batters")
+
+        # MLB pitcher stats for today's starters
         for g in games:
             for key in ("home_sp", "away_sp"):
                 sp = g[key]
@@ -638,19 +728,33 @@ def refresh(force=False):
                             sv_pit[sname] = {}
                         sv_pit[sname]["_mlb"] = stats
 
-        cands = build_candidates(games, hr_props, sv_bat, sv_pit, xst_bat, xst_pit)
+        # Roster fallback when lineups aren't posted yet
+        lineups_available = any(g["home_lineup"] or g["away_lineup"] for g in games)
+        rosters = {}
+        if not lineups_available and games:
+            print("[Refresh] Lineups not available — fetching team rosters")
+            for g in games:
+                for abbr, tid in [(g["home_abbr"], g.get("home_id")),
+                                  (g["away_abbr"], g.get("away_id"))]:
+                    if abbr and abbr not in rosters:
+                        rosters[abbr] = fetch_roster(tid)
+            total_roster = sum(len(v) for v in rosters.values())
+            print(f"[Refresh] Rosters: {len(rosters)} teams, {total_roster} players")
+
+        cands = build_candidates(games, hr_props, sv_bat, sv_pit, xst_bat, xst_pit, rosters)
 
         with _lock:
             _cache.update({
-                "date":         today,
-                "candidates":   cands,
-                "games":        len(games),
-                "with_props":   sum(1 for c in cands if c["has_prop"]),
-                "last_refresh": now_est().strftime("%I:%M %p ET"),
-                "status":       "ready",
-                "error":        None,
+                "date":              today,
+                "candidates":        cands,
+                "games":             len(games),
+                "with_props":        sum(1 for c in cands if c["has_prop"]),
+                "lineups_available": lineups_available,
+                "last_refresh":      now_est().strftime("%I:%M %p ET"),
+                "status":            "ready",
+                "error":             None,
             })
-        print(f"[Refresh] Done — {len(cands)} candidates, {len(hr_props)} props")
+        print(f"[Refresh] Done — {len(cands)} candidates, {len(hr_props)} props, lineups={lineups_available}")
     except Exception as e:
         import traceback; traceback.print_exc()
         with _lock:
@@ -673,12 +777,14 @@ def api_hr():
     if _cache["status"] == "error":
         return jsonify({"error": _cache.get("error","Unknown error")})
     return jsonify({
-        "date":         now_est().strftime("%A, %B %d, %Y"),
-        "last_refresh": _cache["last_refresh"],
-        "games":        _cache["games"],
-        "with_props":   _cache["with_props"],
-        "total":        len(_cache["candidates"]),
-        "candidates":   _cache["candidates"],
+        "date":              now_est().strftime("%A, %B %d, %Y"),
+        "last_refresh":      _cache["last_refresh"],
+        "games":             _cache["games"],
+        "with_props":        _cache["with_props"],
+        "lineups_available": _cache.get("lineups_available", False),
+        "odds_api_set":      bool(ODDS_API_KEY),
+        "total":             len(_cache["candidates"]),
+        "candidates":        _cache["candidates"],
     })
 
 @app.route("/api/refresh", methods=["GET","POST"])
@@ -795,7 +901,7 @@ footer{text-align:center;padding:20px;font-size:10px;color:rgba(255,255,255,.12)
 </div>
 <footer>TwinPicks HR Finder — Statcast · Starting Pitcher · Sportsbook</footer>
 <script>
-var D=null,filt='props',_pt=null;
+var D=null,filt='props',_pt=null,ODDS_API_KEY_SET=false;
 document.querySelectorAll('.ftab').forEach(function(b){b.addEventListener('click',function(){
   document.querySelectorAll('.ftab').forEach(function(x){x.classList.remove('on')});
   b.classList.add('on');filt=b.dataset.f;if(D)render(D);
@@ -828,8 +934,14 @@ function render(d){
   sb+='<div class="sc"><div class="sl">Showing</div><div class="sv">'+cands.length+'</div></div>';
   document.getElementById('sbar').innerHTML=sb;
   document.getElementById('sub').textContent=d.date||'';
-  document.getElementById('lr').textContent=d.last_refresh?'Refreshed '+d.last_refresh:'';
-  if(!cands.length){document.getElementById('out').innerHTML='<div class="empty">'+(filt==='props'?'No HR props loaded. Add ODDS_API_KEY or switch to All Players.':'No candidates today.')+'</div>';return}
+  var lrParts=[];
+  if(d.last_refresh)lrParts.push('Refreshed '+d.last_refresh);
+  if(!d.lineups_available)lrParts.push('⚠ Lineups not posted — using rosters');
+  if(!d.with_props&&ODDS_API_KEY_SET)lrParts.push('⚠ No sportsbook lines yet');
+  document.getElementById('lr').textContent=lrParts.join(' · ');
+  if(!cands.length){
+    var msg=filt==='props'?'No HR props loaded — switch to All Players or add ODDS_API_KEY env var.':'No players found. Rosters/lineups may still be loading.';
+    document.getElementById('out').innerHTML='<div class="empty">'+msg+'</div>';return}
   var h='<div class="grid">';
   for(var i=0;i<cands.length;i++){
     var c=cands[i],st=c.statcast||{},pr=c.prop,pi=c.pitcher||{},sc=c.hr_score;
@@ -909,7 +1021,7 @@ function load(){
     if(_pt){clearInterval(_pt);_pt=null}
     document.getElementById('stmsg').style.display='none';
     if(d.error){document.getElementById('out').innerHTML='<div class="empty">'+d.error+'</div>';return}
-    D=d;render(d);
+    D=d;if(d.odds_api_set!==undefined)ODDS_API_KEY_SET=d.odds_api_set;render(d);
   }).catch(function(){document.getElementById('out').innerHTML='<div class="empty">Error. <a href="javascript:load()" style="color:var(--blue)">Retry</a></div>'});
 }
 load();
